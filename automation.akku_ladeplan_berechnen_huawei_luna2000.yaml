@@ -10,7 +10,6 @@ triggers:
 variables:
   daily_consumption: 11
   battery_capacity: 15
-  min_soc: 15
   min_soc_sicher: 20
   reserve_soc: 30
   sicherheits_offset: 4
@@ -131,142 +130,34 @@ actions:
             value_template: "{{ charge_target > 0.3 }}"
         sequence:
           - variables:
-              # Schritt 1: Preise nach Zeit sortieren und nur zukünftige Preise behalten
-              prices_sorted_by_time: >
-                {% if prices|count > 0 %}
-                  {% set now_date = now().strftime('%Y-%m-%d') %}
-                  {% set now_h = now().hour %}
-                  {% set filtered = [] %}
-                  {% for entry in prices %}
-                    {% set ts = entry[0] %}
-                    {% if 'T' in ts %}
-                      {% set d = ts.split('T')[0] %}
-                      {% set t = ts.split('T')[1] %}
-                      {% set h = t[:2] | int %}
-                      {% if d > now_date or (d == now_date and h >= now_h) %}
-                        {% set filtered = filtered + [entry] %}
-                      {% endif %}
-                    {% else %}
-                      {% set filtered = filtered + [entry] %}
-                    {% endif %}
-                  {% endfor %}
-                  {{ filtered | sort(attribute=0) | list }}
-                {% else %}
-                  []
-                {% endif %}
-              # Schritt 2: Günstigsten aufeinanderfolgenden Block finden
-              best_window_start_idx: >
-                {% if prices_sorted_by_time|count > 0 and needed_hours|int > 0 %}
-                  {% set nh = needed_hours|int %}
-                  {% set total = prices_sorted_by_time|count %}
-                  {% if total >= nh %}
-                    {% set best_avg = 999999.0 %}
-                    {% set best_start = 0 %}
-                    {% set start_counter = 0 %}
-                    {% for start_entry in prices_sorted_by_time %}
-                      {% if start_counter + nh <= total %}
-                        {% set window_prices = [] %}
-                        {% set check_counter = 0 %}
-                        {% for check_entry in prices_sorted_by_time %}
-                          {% if check_counter >= start_counter and check_counter < start_counter + nh %}
-                            {% set window_prices = window_prices + [check_entry[1] | float(0)] %}
-                          {% endif %}
-                          {% set check_counter = check_counter + 1 %}
-                        {% endfor %}
-                        {% if window_prices|count == nh %}
-                          {% set avg = (window_prices | sum / nh) %}
-                          {% if avg < best_avg %}
-                            {% set best_avg = avg %}
-                            {% set best_start = start_counter %}
-                          {% endif %}
-                        {% endif %}
-                      {% endif %}
-                      {% set start_counter = start_counter + 1 %}
-                    {% endfor %}
-                    {{ best_start }}
-                  {% else %}
-                    0
-                  {% endif %}
-                {% else %}
-                  0
-                {% endif %}
               start_hour: >
-                {% if prices_sorted_by_time|count > 0 and needed_hours|int > 0 %}
-                  {% set start_idx = best_window_start_idx | int %}
-                  {% if start_idx < prices_sorted_by_time|count %}
-                    {% set t = prices_sorted_by_time[start_idx][0] %}
+                {% if sorted_prices|count > 0 %}
+                  {% set t = sorted_prices[0][0] %}
+                  {% if 'T' in t %}{{ t.split('T')[1][:5] }}{% else %}{{ t }}{% endif %}
+                {% else %}''{% endif %}
+              end_hour: >
+                {% if sorted_prices|count > 0 %}
+                  {% if needed_hours|int <= 1 %}
+                    {% set t = sorted_prices[0][0] %}
+                    {% set h = (t.split('T')[1][:2] | int + 1) % 24 %}
+                    {{ "%02d" % h }}:{{ t.split('T')[1][3:5] }}
+                  {% else %}
+                    {% set t = sorted_prices[needed_hours|int - 1][0] %}
                     {% if 'T' in t %}
                       {{ t.split('T')[1][:5] }}
                     {% else %}
                       {{ t }}
                     {% endif %}
-                  {% else %}''{% endif %}
-                {% else %}''{% endif %}
-              end_hour: >
-                {% if prices_sorted_by_time|count > 0 and needed_hours|int > 0 %}
-                  {% set start_idx = best_window_start_idx | int %}
-                  {% set nh = needed_hours|int %}
-                  {% if start_idx < prices_sorted_by_time|count %}
-                    {% set end_idx = start_idx + nh - 1 %}
-                    {% if end_idx < prices_sorted_by_time|count %}
-                      {% set t = prices_sorted_by_time[end_idx][0] %}
-                      {% if 'T' in t %}
-                        {% set hour_str = t.split('T')[1][:2] %}
-                        {% set hour = (hour_str | int + 1) %}
-                        {% if hour >= 24 %}
-                          {% set hour = hour - 24 %}
-                        {% endif %}
-                        {{ "%02d" % hour }}:00
-                      {% else %}
-                        {{ t }}
-                      {% endif %}
-                    {% else %}
-                      {% set t = prices_sorted_by_time[start_idx][0] %}
-                      {% if 'T' in t %}
-                        {% set hour_str = t.split('T')[1][:2] %}
-                        {% set hour = (hour_str | int + nh) %}
-                        {% if hour >= 24 %}
-                          {% set hour = hour - 24 %}
-                        {% endif %}
-                        {{ "%02d" % hour }}:00
-                      {% else %}
-                        {{ t }}
-                      {% endif %}
-                    {% endif %}
-                  {% else %}''{% endif %}
+                  {% endif %}
                 {% else %}''{% endif %}
               avg_price: >
-                {% if prices_sorted_by_time|count > 0 and needed_hours|int > 0 %}
-                  {% set start_idx = best_window_start_idx | int %}
-                  {% set nh = needed_hours|int %}
-                  {% if start_idx < prices_sorted_by_time|count %}
-                    {% set window_prices = [] %}
-                    {% set check_counter = 0 %}
-                    {% for check_entry in prices_sorted_by_time %}
-                      {% if check_counter >= start_idx and check_counter < start_idx + nh %}
-                        {% set window_prices = window_prices + [check_entry[1] | float(0)] %}
-                      {% endif %}
-                      {% set check_counter = check_counter + 1 %}
-                    {% endfor %}
-                    {% if window_prices|count == nh %}
-                      {{ (window_prices | sum / nh) | round(3) }}
-                    {% else %}
-                      0
-                    {% endif %}
-                  {% else %}
-                    0
-                  {% endif %}
+                {% if sorted_prices|count > 0 %}
+                  {% set p = sorted_prices | map(attribute='1') | list %}
+                  {{ (p[:needed_hours|int] | sum / (needed_hours|int)) | round(3) }}
                 {% else %}
                   0
                 {% endif %}
 
-          - action: system_log.write
-            data:
-              level: info
-              message: >
-                DEBUG Block-Suche: prices_sorted_by_time count={{ prices_sorted_by_time|count }},
-                needed_hours={{ needed_hours }}, best_window_start_idx={{ best_window_start_idx }},
-                start_hour="{{ start_hour }}", end_hour="{{ end_hour }}", avg_price={{ avg_price }}
           - action: input_text.set_value
             target:
               entity_id: input_text.akku_ladeplan_json
