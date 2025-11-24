@@ -1,0 +1,138 @@
+alias: Akku Netzladung gemäß Plan (Huawei LUNA2000)
+description: >
+  Führt den Ladeplan automatisch aus – egal ob Zwischenladen (JETZT)
+  oder zeitgesteuertes Laden. Nutzt huawei_solar.forcible_charge_soc mit
+  target_soc und schaltet zusätzlich den Netzlade-Switch.
+trigger:
+  - platform: state
+    entity_id: input_text.akku_ladeplan_json
+
+variables:
+  plan: "{{ states('input_text.akku_ladeplan_json') | from_json }}"
+  start_time: "{{ plan.start }}"
+  end_time: "{{ plan.end }}"
+  soc_target: "{{ plan.soc_target | float(0) }}"
+  avg_price: "{{ plan.avg_price | float(0) }}"
+  energy: "{{ plan.energy | float(0) }}"
+  is_zwischenladen: "{{ start_time | lower == 'jetzt' }}"
+  stop_threshold: "{{ (plan.soc_target | float(0)) - 1.0 }}"
+  charge_power: "5000"
+  inverter_device_id: "66c3cc613395f9fb710d08b5d43947ba"
+
+actions:
+  - service: system_log.write
+    data:
+      level: info
+      message: >
+        Ladeplan empfangen – Start: {{ start_time }}, Ziel-SOC: {{ soc_target }} %,
+        Energie: {{ energy }} kWh, Preis: {{ avg_price }} €/kWh,
+        Zwischenladen: {{ is_zwischenladen }}.
+
+  # --- Zwischenladen sofort starten ---
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ is_zwischenladen }}"
+        sequence:
+          - service: switch.turn_on
+            target:
+              entity_id: switch.batterien_laden_aus_dem_netz
+
+          # Huawei forcible charge SOC
+          - service: huawei_solar.forcible_charge_soc
+            data:
+              target_soc: "{{ soc_target | int }}"
+              power: "{{ charge_power }}"
+              device_id: "{{ inverter_device_id }}"
+
+          - service: system_log.write
+            data:
+              level: info
+              message: "Zwischenladen gestartet bis {{ soc_target }} % ({{ charge_power }} W)."
+
+          - repeat:
+              for_each:
+                - notify.mobile_app_iphone_von_peter
+                - notify.mobile_app_nils_iphone
+                - notify.mobile_app_nils_iphone13
+                - notify.mobile_app_sm_g990b
+              sequence:
+                - service: "{{ repeat.item }}"
+                  data:
+                    title: "Zwischenladen gestartet ⚡"
+                    message: "Ladeakku lädt jetzt bis {{ soc_target }} % ({{ charge_power }} W)."
+
+  # --- Regulärer Ladeplan mit Uhrzeit ---
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ not is_zwischenladen and start_time != '' }}"
+        sequence:
+          - service: system_log.write
+            data:
+              level: info
+              message: "Warten bis Startzeit {{ start_time }}..."
+          - wait_for_trigger:
+              - platform: time
+                at: "{{ start_time }}"
+            timeout: "12:00:00"
+
+          - service: switch.turn_on
+            target:
+              entity_id: switch.batterien_laden_aus_dem_netz
+
+          # Start forcible charge SOC
+          - service: huawei_solar.forcible_charge_soc
+            data:
+              target_soc: "{{ soc_target | int }}"
+              power: "{{ charge_power }}"
+              device_id: "{{ inverter_device_id }}"
+
+          - service: system_log.write
+            data:
+              level: info
+              message: >
+                Netzladung gestartet – Ziel: {{ soc_target }} % mit {{ charge_power }} W.
+
+          - repeat:
+              for_each:
+                - notify.mobile_app_iphone_von_peter
+                - notify.mobile_app_nils_iphone
+                - notify.mobile_app_nils_iphone13
+                - notify.mobile_app_sm_g990b
+              sequence:
+                - service: "{{ repeat.item }}"
+                  data:
+                    title: "Netzladung gestartet ⚡"
+                    message: "Ladeakku lädt jetzt bis {{ soc_target }} % ({{ charge_power }} W)."
+
+          # --- Automatischer Stopp ---
+          - wait_template: >
+              {{ states('sensor.huawei_inverter_battery_soc')|float(0) >= stop_threshold
+                 or now().strftime('%H:%M') == end_time }}
+            timeout: "06:00:00"
+
+          - service: huawei_solar.stop_forcible_charge
+            data:
+              device_id: "{{ inverter_device_id }}"
+
+          - service: switch.turn_off
+            target:
+              entity_id: switch.batterien_laden_aus_dem_netz
+
+          - service: system_log.write
+            data:
+              level: info
+              message: "Netzladen beendet – Ziel erreicht oder Zeit abgelaufen."
+
+          - repeat:
+              for_each:
+                - notify.mobile_app_iphone_von_peter
+                - notify.mobile_app_nils_iphone
+                - notify.mobile_app_nils_iphone13
+                - notify.mobile_app_sm_g990b
+              sequence:
+                - service: "{{ repeat.item }}"
+                  data:
+                    title: "Netzladung beendet ✅"
+                    message: "Laden abgeschlossen (Ziel-SOC {{ soc_target }} %)."

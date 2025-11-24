@@ -1,0 +1,251 @@
+alias: Akku Ladeplan berechnen (Huawei LUNA2000)
+description: >
+  Berechnet täglich um 18 Uhr den günstigsten Ladeplan für den Huawei
+  LUNA2000-Akku auf Basis der Solarprognose, des Strompreises, des aktuellen SOC
+  und vermeidet Leerlaufen. Sendet Benachrichtigungen an alle Geräte.
+triggers:
+  - at: "18:00:00"
+    trigger: time
+
+variables:
+  daily_consumption: 11
+  battery_capacity: 15
+  min_soc: 15
+  min_soc_sicher: 20
+  reserve_soc: 30
+  sicherheits_offset: 4
+
+  solar_tomorrow: "{{ states('sensor.energy_production_tomorrow_2') | float(0) }}"
+  soc_now: "{{ states('sensor.batterien_batterieladung') | float(0) }}"
+  prices_raw: "{{ state_attr('sensor.ostrom_energy_spotpreis', 'prices') }}"
+
+  prices: >
+    {% set parsed = namespace(list=[]) %}
+    {% if prices_raw %}
+      {% for k, v in prices_raw.items() %}
+        {% set parsed.list = parsed.list + [[k, v | float(0)]] %}
+      {% endfor %}
+    {% endif %}
+    {{ parsed.list }}
+
+  energy_missing: >
+    {% set available_in_battery = soc_now / 100 * battery_capacity %}
+    {% set missing = daily_consumption - solar_tomorrow - available_in_battery %}
+    {{ [missing, 0] | max }}
+
+  free_capacity: "{{ battery_capacity * (1 - soc_now / 100) }}"
+  charge_target: "{{ [energy_missing, free_capacity] | min }}"
+  soc_target: >
+    {% set calc = ((soc_now / 100) * battery_capacity + charge_target) / battery_capacity * 100 %}
+    {{ [calc, 40] | max }}
+  charge_power_kw: 5
+  needed_hours: "{{ (charge_target / charge_power_kw) | round(0, 'ceil') }}"
+
+  sorted_prices: >
+    {% if prices %}
+      {{ prices | sort(attribute=1) | list }}
+    {% else %}
+      []
+    {% endif %}
+
+  cheapest_hour: >
+    {% if sorted_prices|count > 0 %}
+      {% set t = sorted_prices[0][0] %}
+      {% if 'T' in t %}{{ t.split('T')[1][:5] }}{% else %}{{ t }}{% endif %}
+    {% else %}''{% endif %}
+  cheapest_price: >
+    {% if sorted_prices|count > 0 %}
+      {{ sorted_prices[0][1] | round(3) }}
+    {% else %}0{% endif %}
+
+actions:
+  - action: system_log.write
+    data:
+      level: info
+      message: >
+        DEBUG Preise: {{ prices }},
+        solar_tomorrow: {{ solar_tomorrow }},
+        soc_now: {{ soc_now }},
+        energy_missing: {{ energy_missing }},
+        charge_target: {{ charge_target }},
+        soc_target: {{ soc_target }}
+
+  # --- Zwischenladen ---
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: >
+              {% set cheapest_time = (sorted_prices[0][0] if sorted_prices|count > 0 else '') %}
+              {% if cheapest_time != '' %}
+                {% set hour_now = now().hour %}
+                {% set hour_cheap = (cheapest_time.split('T')[1][:2] | int) %}
+                {% set diff = (hour_cheap - hour_now) if (hour_cheap - hour_now) > 0 else (24 + hour_cheap - hour_now) %}
+                {{ soc_now < min_soc_sicher and diff > sicherheits_offset }}
+              {% else %}
+                false
+              {% endif %}
+        sequence:
+          - action: system_log.write
+            data:
+              level: warning
+              message: >
+                Zwischenladen aktiviert: SOC {{ soc_now }} % < {{ min_soc_sicher }} %,
+                günstigste Zeit erst in >{{ sicherheits_offset }}h.
+                Lade bis {{ reserve_soc }} %.
+
+          - action: input_text.set_value
+            target:
+              entity_id: input_text.akku_ladeplan_json
+            data:
+              value: >
+                {
+                  "start": "JETZT",
+                  "end": "ca. 1h",
+                  "energy": {{ ((reserve_soc - soc_now)/100 * battery_capacity) | round(1) }},
+                  "avg_price": -1,
+                  "soc_target": {{ reserve_soc }}
+                }
+
+          - service: notify.mobile_app_iphone_von_peter
+            data:
+              title: "Zwischenladen aktiviert ⚡"
+              message: "SOC {{ soc_now }} % → Lade sofort bis {{ reserve_soc }} %."
+          - service: notify.mobile_app_nils_iphone
+            data:
+              title: "Zwischenladen aktiviert ⚡"
+              message: "SOC {{ soc_now }} % → Lade sofort bis {{ reserve_soc }} %."
+          - service: notify.mobile_app_nils_iphone13
+            data:
+              title: "Zwischenladen aktiviert ⚡"
+              message: "SOC {{ soc_now }} % → Lade sofort bis {{ reserve_soc }} %."
+          - service: notify.mobile_app_sm_g990b
+            data:
+              title: "Zwischenladen aktiviert ⚡"
+              message: "SOC {{ soc_now }} % → Lade sofort bis {{ reserve_soc }} %."
+
+  # --- Hauptladeplan ---
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ charge_target > 0.3 }}"
+        sequence:
+          - variables:
+              start_hour: >
+                {% if sorted_prices|count > 0 %}
+                  {% set t = sorted_prices[0][0] %}
+                  {% if 'T' in t %}{{ t.split('T')[1][:5] }}{% else %}{{ t }}{% endif %}
+                {% else %}''{% endif %}
+              end_hour: >
+                {% if sorted_prices|count > 0 %}
+                  {% if needed_hours|int <= 1 %}
+                    {% set t = sorted_prices[0][0] %}
+                    {% set h = (t.split('T')[1][:2] | int + 1) % 24 %}
+                    {{ "%02d" % h }}:{{ t.split('T')[1][3:5] }}
+                  {% else %}
+                    {% set t = sorted_prices[needed_hours|int - 1][0] %}
+                    {% if 'T' in t %}
+                      {{ t.split('T')[1][:5] }}
+                    {% else %}
+                      {{ t }}
+                    {% endif %}
+                  {% endif %}
+                {% else %}''{% endif %}
+              avg_price: >
+                {% if sorted_prices|count > 0 %}
+                  {% set p = sorted_prices | map(attribute='1') | list %}
+                  {{ (p[:needed_hours|int] | sum / (needed_hours|int)) | round(3) }}
+                {% else %}
+                  0
+                {% endif %}
+
+          - action: input_text.set_value
+            target:
+              entity_id: input_text.akku_ladeplan_json
+            data:
+              value: >
+                {
+                  "start": "{{ start_hour }}",
+                  "end": "{{ end_hour }}",
+                  "energy": {{ charge_target | round(1) }},
+                  "avg_price": {{ avg_price }},
+                  "soc_target": {{ soc_target | round(0) }}
+                }
+
+          - action: system_log.write
+            data:
+              level: info
+              message: >
+                Neuer Ladeplan erstellt:
+                Start {{ start_hour }}, Ende {{ end_hour }},
+                Energie {{ charge_target | round(1) }} kWh,
+                Ø Preis {{ avg_price }} €/kWh,
+                SOC-Ziel {{ soc_target | round(0) }} %.
+
+          - service: notify.mobile_app_iphone_von_peter
+            data:
+              title: "Neuer Ladeplan erstellt ⚡"
+              message: >
+                Ladeplan: {{ start_hour }}–{{ end_hour }},
+                Ziel-SOC {{ soc_target | round(0) }} %,
+                Energie {{ charge_target | round(1) }} kWh,
+                Ø Preis {{ avg_price }} €/kWh. Günstigste Stunde: {{ cheapest_hour }} Uhr zu {{ cheapest_price }} €/kWh.
+          - service: notify.mobile_app_nils_iphone
+            data:
+              title: "Neuer Ladeplan erstellt ⚡"
+              message: >
+                Ladeplan: {{ start_hour }}–{{ end_hour }},
+                Ziel-SOC {{ soc_target | round(0) }} %,
+                Energie {{ charge_target | round(1) }} kWh,
+                Ø Preis {{ avg_price }} €/kWh. Günstigste Stunde: {{ cheapest_hour }} Uhr zu {{ cheapest_price }} €/kWh.
+          - service: notify.mobile_app_nils_iphone13
+            data:
+              title: "Neuer Ladeplan erstellt ⚡"
+              message: >
+                Ladeplan: {{ start_hour }}–{{ end_hour }},
+                Ziel-SOC {{ soc_target | round(0) }} %,
+                Energie {{ charge_target | round(1) }} kWh,
+                Ø Preis {{ avg_price }} €/kWh. Günstigste Stunde: {{ cheapest_hour }} Uhr zu {{ cheapest_price }} €/kWh.
+          - service: notify.mobile_app_sm_g990b
+            data:
+              title: "Neuer Ladeplan erstellt ⚡"
+              message: >
+                Ladeplan: {{ start_hour }}–{{ end_hour }},
+                Ziel-SOC {{ soc_target | round(0) }} %,
+                Energie {{ charge_target | round(1) }} kWh,
+                Ø Preis {{ avg_price }} €/kWh. Günstigste Stunde: {{ cheapest_hour }} Uhr zu {{ cheapest_price }} €/kWh.
+
+    # --- Kein Laden nötig ---
+    default:
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.akku_ladeplan_json
+        data:
+          value: '{"start":"","end":"","energy":0,"avg_price":0}'
+      - action: system_log.write
+        data:
+          level: info
+          message: Kein Netzladen erforderlich – Solarenergie deckt Bedarf.
+      - service: notify.mobile_app_iphone_von_peter
+        data:
+          title: "Kein Laden nötig ☀️"
+          message: >
+            Kein Netzladen erforderlich – Solarenergie deckt Bedarf.
+            Günstigste Stunde: {{ cheapest_hour }} Uhr zu {{ cheapest_price }} €/kWh.
+      - service: notify.mobile_app_nils_iphone
+        data:
+          title: "Kein Laden nötig ☀️"
+          message: >
+            Kein Netzladen erforderlich – Solarenergie deckt Bedarf.
+            Günstigste Stunde: {{ cheapest_hour }} Uhr zu {{ cheapest_price }} €/kWh.
+      - service: notify.mobile_app_nils_iphone13
+        data:
+          title: "Kein Laden nötig ☀️"
+          message: >
+            Kein Netzladen erforderlich – Solarenergie deckt Bedarf.
+            Günstigste Stunde: {{ cheapest_hour }} Uhr zu {{ cheapest_price }} €/kWh.
+      - service: notify.mobile_app_sm_g990b
+        data:
+          title: "Kein Laden nötig ☀️"
+          message: >
+            Kein Netzladen erforderlich – Solarenergie deckt Bedarf.
+            Günstigste Stunde: {{ cheapest_hour }} Uhr zu {{ cheapest_price }} €/kWh.
